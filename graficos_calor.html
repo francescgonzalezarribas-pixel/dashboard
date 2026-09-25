@@ -24,8 +24,7 @@
   .leyenda{font-size:11.5px; color:var(--muted); display:flex; gap:12px; align-items:center; flex-wrap:wrap; justify-content:center;}
   .escala{width:120px; height:9px; border-radius:4px; background:linear-gradient(90deg,#0d1117,#1e3a5f,#2a7a8c,#3fae62,#e8d44d,#e8734d);}
 
-  .grid{ display:grid; grid-template-columns:1fr; gap:14px; width:100%; max-width:1100px; }
-  @media(min-width:820px){ .grid{ grid-template-columns:1fr 1fr; } }
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px; width:100%; max-width:1100px; }
 
   .panel{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; }
   .cab{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
@@ -210,8 +209,14 @@ async function tomarMuestra(m){
     };
     j.bids.forEach(acumular);
     j.asks.forEach(acumular);
-    p.muestras.push({ t: Math.floor(Date.now()/1000), lo, hi, bins });
-    if(p.muestras.length > MAX_MUESTRAS) p.muestras.shift();
+    const minutoAlineado = Math.floor(Date.now()/60000)*60; // se engancha al minuto exacto de la vela
+    const ultima = p.muestras[p.muestras.length-1];
+    if(ultima && ultima.t === minutoAlineado){
+      ultima.bins = bins; ultima.lo = lo; ultima.hi = hi; // mismo minuto: nos quedamos con la foto más reciente
+    }else{
+      p.muestras.push({ t: minutoAlineado, lo, hi, bins });
+      if(p.muestras.length > MAX_MUESTRAS) p.muestras.shift();
+    }
     document.getElementById(`punto-${m.sym}`).className = "punto on";
     document.getElementById(`estado-${m.sym}`).textContent = "en directo (Binance)";
     dibujarCalor(m.sym);
@@ -232,14 +237,13 @@ function dibujarCalor(symbol){
   for(const s of muestras) for(const v of s.bins) if(v>maxVal) maxVal = v;
 
   const ts = chart.timeScale();
+  const anchoVela = Math.max(2, ts.options().barSpacing) * devicePixelRatio;
   for(let i=0;i<muestras.length;i++){
     const s = muestras[i];
-    const sigPor = muestras[i+1] ? muestras[i+1].t : Math.floor(Date.now()/1000)+INTERVALO_MUESTREO/1000;
     const x1 = ts.timeToCoordinate(s.t);
-    const x2 = ts.timeToCoordinate(sigPor);
     if(x1===null) continue;
-    const xa = x1*devicePixelRatio, xb = (x2!==null?x2:x1+30)*devicePixelRatio;
-    const anchoCol = Math.max(1, xb-xa);
+    const xa = x1*devicePixelRatio - anchoVela/2;
+    const anchoCol = anchoVela;
     for(let b=0;b<N_BINS;b++){
       const val = s.bins[b];
       if(val<=0) continue;
