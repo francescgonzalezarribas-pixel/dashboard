@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gráficos en directo — muros de órdenes</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#131722; --border:#2a2e39;
+    --up:#26a69a; --down:#ef5350; --muted:#8a93a6;
+    box-sizing:border-box;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:#fff;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    padding:14px; display:flex; flex-direction:column; align-items:center; gap:14px;
+  }
+  h1{font-size:14px; font-weight:700; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; margin:4px 0 0;}
+  .leyenda{font-size:11.5px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap; justify-content:center;}
+  .leyenda span{display:flex; align-items:center; gap:5px;}
+  .barra{width:12px; height:3px; border-radius:2px;}
+
+  .grid{ display:grid; grid-template-columns:1fr; gap:14px; width:100%; max-width:1100px; }
+  @media(min-width:820px){ .grid{ grid-template-columns:1fr 1fr; } }
+
+  .panel{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; }
+  .cab{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+  .cab .sym{ font-weight:800; font-size:15px; }
+  .cab .precio{ font-weight:700; font-size:15px; font-variant-numeric:tabular-nums; }
+  .cab .cambio{ font-size:12px; font-weight:700; margin-left:6px; }
+  .cab .cambio.pos{ color:var(--up); }
+  .cab .cambio.neg{ color:var(--down); }
+  .estadito{ font-size:10.5px; color:var(--muted); display:flex; align-items:center; gap:5px; margin-bottom:6px; }
+  .punto{width:6px; height:6px; border-radius:50%; background:var(--muted);}
+  .punto.on{background:var(--up);}
+  .chart{ width:100%; height:230px; }
+
+  footer{font-size:11px; color:var(--muted); text-align:center; max-width:700px; line-height:1.5; margin-top:2px;}
+  footer b{color:#ccc;}
+</style>
+</head>
+<body>
+
+  <h1>4 gráficos en directo — velas + muros de órdenes</h1>
+  <div class="leyenda">
+    <span><span class="barra" style="background:#00CC44;"></span> soporte (compra)</span>
+    <span><span class="barra" style="background:#FF3333;"></span> resistencia (venta)</span>
+    <span>más gruesa = muro más grande</span>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <footer>
+    Velas de 1 minuto y libro de órdenes en directo de <b>Binance</b> (sin clave). Las líneas de muros se
+    actualizan cada pocos segundos. Solo informativo, no asesoramiento financiero.
+  </footer>
+
+<script>
+const MONEDAS = [
+  {sym:"BTCUSDT", nombre:"BTC"},
+  {sym:"ETHUSDT", nombre:"ETH"},
+  {sym:"SOLUSDT", nombre:"SOL"},
+  {sym:"HYPEUSDT", nombre:"HYPE"},
+];
+const RANGO_MUROS = 0.06; // ±6% alrededor del precio para buscar muros
+const N_MUROS = 3;        // cuántos muros por lado se dibujan
+
+function decimales(p){ return p>=1000?0 : p>=100?1 : p>=1?2 : 4; }
+function fmt(p){ return "$"+p.toLocaleString("en-US",{minimumFractionDigits:decimales(p),maximumFractionDigits:decimales(p)}); }
+
+const grid = document.getElementById("grid");
+const paneles = {};
+
+MONEDAS.forEach(m=>{
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `
+    <div class="cab">
+      <span class="sym">${m.nombre}</span>
+      <span><span class="precio" id="precio-${m.sym}">…</span><span class="cambio" id="cambio-${m.sym}"></span></span>
+    </div>
+    <div class="estadito"><span class="punto" id="punto-${m.sym}"></span><span id="estado-${m.sym}">conectando…</span></div>
+    <div class="chart" id="chart-${m.sym}"></div>
+  `;
+  grid.appendChild(panel);
+
+  const chart = LightweightCharts.createChart(document.getElementById(`chart-${m.sym}`), {
+    layout:{ background:{color:"transparent"}, textColor:"#8a93a6", fontSize:10.5 },
+    grid:{ vertLines:{color:"#1c2130"}, horzLines:{color:"#1c2130"} },
+    rightPriceScale:{ borderColor:"#2a2e39" },
+    timeScale:{ borderColor:"#2a2e39", timeVisible:true, secondsVisible:false },
+    crosshair:{ mode:0 },
+  });
+  const serie = chart.addCandlestickSeries({
+    upColor:"#26a69a", downColor:"#ef5350",
+    borderUpColor:"#26a69a", borderDownColor:"#ef5350",
+    wickUpColor:"#26a69a", wickDownColor:"#ef5350",
+  });
+  new ResizeObserver(entries=>{
+    for(const e of entries) chart.applyOptions({width:e.contentRect.width, height:230});
+  }).observe(document.getElementById(`chart-${m.sym}`));
+
+  paneles[m.sym] = { chart, serie, nombre:m.nombre, precio:null, lineasMuros:[] };
+});
+
+// ── Velas: historial inicial por REST + actualización en directo por WebSocket ──
+async function cargarHistorial(symbol){
+  const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=120`);
+  const kl = await r.json();
+  return kl.map(k=>({ time: Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4] }));
+}
+
+async function iniciarVelas(){
+  for(const m of MONEDAS){
+    try{
+      const velas = await cargarHistorial(m.sym);
+      paneles[m.sym].serie.setData(velas);
+      paneles[m.sym].precio = velas[velas.length-1].close;
+    }catch(e){ console.warn("historial", m.sym, e); }
+  }
+  conectarVelasWS();
+}
+
+function conectarVelasWS(){
+  const streams = MONEDAS.map(m=>m.sym.toLowerCase()+"@kline_1m").join("/");
+  const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
+  ws.onmessage = (ev)=>{
+    try{
+      const d = JSON.parse(ev.data).data;
+      const k = d.k;
+      const symbol = d.s;
+      const p = paneles[symbol];
+      if(!p) return;
+      p.serie.update({ time: Math.floor(k.t/1000), open:+k.o, high:+k.h, low:+k.l, close:+k.c });
+      p.precio = +k.c;
+      document.getElementById(`precio-${symbol}`).textContent = fmt(p.precio);
+    }catch(e){}
+  };
+  ws.onclose = ()=> setTimeout(conectarVelasWS, 3000);
+}
+
+// ── Cambio 24h (para el color rojo/verde de la cabecera) ──
+async function actualizarCambio24h(){
+  for(const m of MONEDAS){
+    try{
+      const r = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${m.sym}`);
+      const j = await r.json();
+      const pct = parseFloat(j.priceChangePercent);
+      const el = document.getElementById(`cambio-${m.sym}`);
+      el.textContent = (pct>=0?"▲ ":"▼ ")+Math.abs(pct).toFixed(2)+"%";
+      el.className = "cambio " + (pct>=0?"pos":"neg");
+    }catch(e){}
+  }
+}
+
+// ── Muros del libro de órdenes: se piden por REST cada pocos segundos ──
+function agrupar(niveles, pasoPct){
+  // agrupa niveles de precio muy próximos (dentro de pasoPct) sumando su valor en USD
+  const out = [];
+  let ref=null, usd=0, precioAcum=0;
+  for(const [p,q] of niveles){
+    const usdNivel = p*q;
+    if(ref===null || Math.abs(p-ref)/ref > pasoPct){
+      if(ref!==null) out.push([ref, usd]);
+      ref=p; usd=usdNivel; precioAcum=p*usdNivel;
+    }else{
+      usd += usdNivel; precioAcum += p*usdNivel; ref = precioAcum/usd;
+    }
+  }
+  if(ref!==null) out.push([ref, usd]);
+  return out;
+}
+
+async function actualizarMuros(){
+  for(const m of MONEDAS){
+    const p = paneles[m.sym];
+    if(!p.precio) continue;
+    try{
+      const r = await fetch(`https://api.binance.com/api/v3/depth?symbol=${m.sym}&limit=200`);
+      const j = await r.json();
+      const lo = p.precio*(1-RANGO_MUROS), hi = p.precio*(1+RANGO_MUROS);
+      const bids = j.bids.map(([pr,q])=>[+pr,+q]).filter(([pr])=>pr>=lo && pr<=hi);
+      const asks = j.asks.map(([pr,q])=>[+pr,+q]).filter(([pr])=>pr>=lo && pr<=hi);
+      const muroBids = agrupar(bids, 0.001).sort((a,b)=>b[1]-a[1]).slice(0,N_MUROS);
+      const muroAsks = agrupar(asks, 0.001).sort((a,b)=>b[1]-a[1]).slice(0,N_MUROS);
+      const maxUsd = Math.max(1, ...muroBids.map(x=>x[1]), ...muroAsks.map(x=>x[1]));
+
+      p.lineasMuros.forEach(l=>p.serie.removePriceLine(l));
+      p.lineasMuros = [];
+      const dec = decimales(p.precio);
+      muroBids.forEach(([precio, usd])=>{
+        const grosor = 1 + Math.round((usd/maxUsd)*3);
+        p.lineasMuros.push(p.serie.createPriceLine({
+          price:precio, color:"#00CC44", lineWidth:grosor, lineStyle:2,
+          axisLabelVisible:true, title:`$${(usd/1e6).toFixed(usd>=1e6?1:2)}${usd>=1e6?'M':'K'}`,
+        }));
+      });
+      muroAsks.forEach(([precio, usd])=>{
+        const grosor = 1 + Math.round((usd/maxUsd)*3);
+        p.lineasMuros.push(p.serie.createPriceLine({
+          price:precio, color:"#FF3333", lineWidth:grosor, lineStyle:2,
+          axisLabelVisible:true, title:`$${(usd/1e6).toFixed(usd>=1e6?1:2)}${usd>=1e6?'M':'K'}`,
+        }));
+      });
+      document.getElementById(`punto-${m.sym}`).className = "punto on";
+      document.getElementById(`estado-${m.sym}`).textContent = "en directo (Binance)";
+    }catch(e){
+      document.getElementById(`estado-${m.sym}`).textContent = "reintentando…";
+    }
+  }
+}
+
+iniciarVelas();
+actualizarCambio24h();
+actualizarMuros();
+setInterval(actualizarMuros, 4000);
+setInterval(actualizarCambio24h, 20000);
+</script>
+</body>
+</html>
